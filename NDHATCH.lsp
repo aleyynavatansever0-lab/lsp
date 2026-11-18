@@ -1,0 +1,581 @@
+(defun c:NDHATCH ( / *error* old-cmdecho old-osmode old-hpsep old-hplayer
+                     old-hpisland old-clayer ss i e edata etype lname lay
+                     ss_walls ss_voids ss_cols segs p1 p2 pts v prev closed
+                     rest1 rest2 s1 s2 q1 q2 dx1 dy1 len1 dx2 dy2 len2
+                     ux uy vx vy cross nx ny d1 d2 avg_d abs_d
+                     cnt_cm cnt_m cnt_mm unitScale t10 t15 tol minLen
+                     band_tol min_open max_open tq1 tq2 qmin qmax
+                     ov_start ov_end ext_start ext_end t_start t_end
+                     walls w void_prims copy_list blkObj copyObj expVar
+                     expArr idx subObj subEname va vb vc rad
+                     w_lo w_hi dmin dmax ivs jambs vp kind ta tb tc
+                     da db dc leaf_len hit_pos cs ce j1 j2
+                     iv offx offy c1 c2 c3 c4 ss_del tw tw_reg w_final
+                     h_ent h_obj tColor col_segs col_copies c_obj c_copy
+                     s_pt e_pt c_regs cs_p1 cs_p2 cd1 cd2 ct1 ct2
+                     cmin_d cmax_d cmin_t cmax_t margin )
+  (vl-load-com)
+
+  (setq old-cmdecho  (getvar "CMDECHO")
+        old-osmode   (getvar "OSMODE")
+        old-hpsep    (getvar "HPSEPARATE")
+        old-hplayer  (getvar "HPLAYER")
+        old-hpisland (getvar "HPISLANDDETECTION")
+        old-clayer   (getvar "CLAYER"))
+
+  (defun *error* (msg / del_err)
+    (if (setq del_err (ssget "X" '((8 . "n-temp-walls,n-temp-cols"))))
+      (command "_.ERASE" del_err "")
+    )
+    (if old-cmdecho  (setvar "CMDECHO" old-cmdecho))
+    (if old-osmode   (setvar "OSMODE" old-osmode))
+    (if old-hpsep    (setvar "HPSEPARATE" old-hpsep))
+    (if old-hplayer  (setvar "HPLAYER" old-hplayer))
+    (if old-hpisland (setvar "HPISLANDDETECTION" old-hpisland))
+    (if old-clayer   (setvar "CLAYER" old-clayer))
+    (if (and msg (not (wcmatch (strcase msg) "*BREAK*,*CANCEL*,*EXIT*")))
+      (princ (strcat "\nHata: " msg))
+    )
+    (princ)
+  )
+
+  ;; Yardimci 1: Cizgi/Polyline nesnesinden WCS segment listesi cikar
+  (defun get-ent-segs (ent / ed etp out p_a p_b pt_list vr pr cl)
+    (setq ed  (entget ent)
+          etp (cdr (assoc 0 ed))
+          out nil)
+    (cond
+      ((= etp "LINE")
+       (setq p_a (trans (cdr (assoc 10 ed)) ent 0)
+             p_b (trans (cdr (assoc 11 ed)) ent 0)
+             p_a (list (car p_a) (cadr p_a))
+             p_b (list (car p_b) (cadr p_b)))
+       (if (> (distance p_a p_b) 1e-5)
+         (setq out (list (list p_a p_b)))
+       )
+      )
+      ((= etp "LWPOLYLINE")
+       (setq pt_list nil
+             cl (= 1 (logand 1 (cdr (assoc 70 ed)))))
+       (foreach item ed
+         (if (= (car item) 10)
+           (progn
+             (setq vr (trans (list (cadr item) (caddr item) 0.0) ent 0))
+             (setq pt_list (cons (list (car vr) (cadr vr)) pt_list))
+           )
+         )
+       )
+       (setq pt_list (reverse pt_list))
+       (if (> (length pt_list) 1)
+         (progn
+           (setq pr (car pt_list))
+           (foreach curr (cdr pt_list)
+             (if (> (distance pr curr) 1e-5)
+               (setq out (cons (list pr curr) out))
+             )
+             (setq pr curr)
+           )
+           (if (and cl (> (distance (last pt_list) (car pt_list)) 1e-5))
+             (setq out (cons (list (last pt_list) (car pt_list)) out))
+           )
+         )
+       )
+      )
+      ((= etp "POLYLINE")
+       (setq pt_list nil
+             cl (= 1 (logand 1 (cdr (assoc 70 ed))))
+             vr (entnext ent))
+       (while (and vr (= (cdr (assoc 0 (entget vr))) "VERTEX"))
+         (setq p_a (trans (cdr (assoc 10 (entget vr))) ent 0))
+         (setq pt_list (cons (list (car p_a) (cadr p_a)) pt_list))
+         (setq vr (entnext vr))
+       )
+       (setq pt_list (reverse pt_list))
+       (if (> (length pt_list) 1)
+         (progn
+           (setq pr (car pt_list))
+           (foreach curr (cdr pt_list)
+             (if (> (distance pr curr) 1e-5)
+               (setq out (cons (list pr curr) out))
+             )
+             (setq pr curr)
+           )
+           (if (and cl (> (distance (last pt_list) (car pt_list)) 1e-5))
+             (setq out (cons (list (last pt_list) (car pt_list)) out))
+           )
+         )
+       )
+      )
+    )
+    out
+  )
+
+  ;; Yardimci 2: Duvar araligindan kapi/pencere boslugunu cikar
+  (defun sub-interval (ivList c1 c2 / res a b)
+    (setq res nil)
+    (foreach iv ivList
+      (setq a (car iv)
+            b (cadr iv))
+      (cond
+        ((or (<= c2 a) (>= c1 b))
+         (setq res (cons (list a b) res)))
+        ((and (<= c1 a) (>= c2 b))
+         nil)
+        ((and (> c1 a) (< c2 b))
+         (setq res (cons (list a c1) res))
+         (setq res (cons (list c2 b) res)))
+        ((and (<= c1 a) (< c2 b))
+         (setq res (cons (list c2 b) res)))
+        ((and (> c1 a) (>= c2 b))
+         (setq res (cons (list a c1) res)))
+      )
+    )
+    (reverse res)
+  )
+
+  (setvar "CMDECHO" 0)
+  (setvar "OSMODE" 0)
+
+  (foreach lay '("n-photoshop" "n-temp-walls" "n-temp-cols")
+    (if (not (tblsearch "LAYER" lay))
+      (entmake
+        (list
+          '(0 . "LAYER")
+          '(100 . "AcDbSymbolTableRecord")
+          '(100 . "AcDbLayerTableRecord")
+          (cons 2 lay)
+          '(70 . 0)
+          '(62 . 8)
+        )
+      )
+      (command "_.-LAYER" "_T" lay "_U" lay "_ON" lay "")
+    )
+  )
+
+  (if (setq ss_del (ssget "X" '((8 . "n-temp-walls,n-temp-cols"))))
+    (command "_.ERASE" ss_del "")
+  )
+
+  (princ "\nTum plani secin (n-duvar, n-kapi, n-kapipencere, n-kolon ve n-pencere algilanacak): ")
+  (setq ss (ssget '((0 . "LINE,LWPOLYLINE,POLYLINE,ARC,CIRCLE,INSERT"))))
+
+  (if ss
+    (progn
+      (setq ss_walls (ssadd)
+            ss_voids (ssadd)
+            ss_cols  (ssadd)
+            i 0)
+      (while (< i (sslength ss))
+        (setq e (ssname ss i)
+              lname (strcase (cdr (assoc 8 (entget e)))))
+        (cond
+          ((= lname "N-DUVAR")
+           (ssadd e ss_walls))
+          ((or (wcmatch lname "N-KAP*") (wcmatch lname "N-PENCERE*"))
+           (ssadd e ss_voids))
+          ((wcmatch lname "*KOLON*")
+           (ssadd e ss_cols))
+        )
+        (setq i (1+ i))
+      )
+
+      (if (> (sslength ss_walls) 0)
+        (progn
+          (setq segs nil i 0)
+          (while (< i (sslength ss_walls))
+            (foreach s (get-ent-segs (ssname ss_walls i))
+              (setq segs (cons s segs))
+            )
+            (setq i (1+ i))
+          )
+
+          (setq cnt_cm 0 cnt_m 0 cnt_mm 0 rest1 segs)
+          (while rest1
+            (setq s1 (car rest1) p1 (car s1) p2 (cadr s1)
+                  dx1 (- (car p2) (car p1)) dy1 (- (cadr p2) (cadr p1)) len1 (sqrt (+ (* dx1 dx1) (* dy1 dy1)))
+                  ux (/ dx1 len1) uy (/ dy1 len1) nx (- uy) ny ux rest2 (cdr rest1))
+            (while rest2
+              (setq s2 (car rest2) q1 (car s2) q2 (cadr s2)
+                    dx2 (- (car q2) (car q1)) dy2 (- (cadr q2) (cadr q1)) len2 (sqrt (+ (* dx2 dx2) (* dy2 dy2)))
+                    vx (/ dx2 len2) vy (/ dy2 len2) cross (abs (- (* ux vy) (* uy vx))))
+              (if (< cross 0.015)
+                (progn
+                  (setq d1 (+ (* (- (car q1) (car p1)) nx) (* (- (cadr q1) (cadr p1)) ny))
+                        d2 (+ (* (- (car q2) (car p1)) nx) (* (- (cadr q2) (cadr p1)) ny))
+                        abs_d (abs (* (+ d1 d2) 0.5)))
+                  (cond
+                    ((or (<= (abs (- abs_d 10.0)) 0.5) (<= (abs (- abs_d 15.0)) 0.5)) (setq cnt_cm (1+ cnt_cm)))
+                    ((or (<= (abs (- abs_d 0.10)) 0.005) (<= (abs (- abs_d 0.15)) 0.005)) (setq cnt_m (1+ cnt_m)))
+                    ((or (<= (abs (- abs_d 100.0)) 5.0) (<= (abs (- abs_d 150.0)) 5.0)) (setq cnt_mm (1+ cnt_mm)))
+                  )
+                )
+              )
+              (setq rest2 (cdr rest2))
+            )
+            (setq rest1 (cdr rest1))
+          )
+
+          (cond
+            ((and (> cnt_m cnt_cm) (>= cnt_m cnt_mm))  (setq unitScale 0.01))
+            ((and (> cnt_mm cnt_cm) (> cnt_mm cnt_m))  (setq unitScale 10.0))
+            (T                                         (setq unitScale 1.0))
+          )
+
+          (setq t10      (* 10.0  unitScale)
+                t15      (* 15.0  unitScale)
+                tol      (* 0.5   unitScale)
+                minLen   (* 0.5   unitScale)
+                band_tol (* 3.0   unitScale)
+                min_open (* 35.0  unitScale)
+                max_open (* 260.0 unitScale))
+
+          ;; Kolon nesnelerini kopyala (orijinal cizime zarar vermeden) ve segmentlerini topla
+          (setq col_segs nil col_copies nil i 0)
+          (while (< i (sslength ss_cols))
+            (setq e (ssname ss_cols i)
+                  edata (entget e)
+                  etype (cdr (assoc 0 edata)))
+            (cond
+              ((= etype "INSERT")
+               (setq blkObj (vlax-ename->vla-object e)
+                     copyObj (vl-catch-all-apply 'vla-Copy (list blkObj)))
+               (if (not (vl-catch-all-error-p copyObj))
+                 (progn
+                   (setq expVar (vl-catch-all-apply 'vla-Explode (list copyObj)))
+                   (vl-catch-all-apply 'vla-Delete (list copyObj))
+                   (if (not (vl-catch-all-error-p expVar))
+                     (progn
+                       (setq expArr (vlax-variant-value expVar) idx 0)
+                       (while (<= idx (vlax-safearray-get-u-bound expArr 1))
+                         (setq subObj (vlax-safearray-get-element expArr idx)
+                               subEname (vlax-vla-object->ename subObj)
+                               etype (cdr (assoc 0 (entget subEname))))
+                         (if (member etype '("LINE" "LWPOLYLINE" "POLYLINE" "ARC" "CIRCLE"))
+                           (progn
+                             (vla-put-Layer subObj "n-temp-cols")
+                             (setq col_copies (cons subEname col_copies))
+                           )
+                           (entdel subEname)
+                         )
+                         (setq idx (1+ idx))
+                       )
+                     )
+                   )
+                 )
+               )
+              )
+              ((member etype '("LINE" "LWPOLYLINE" "POLYLINE" "ARC" "CIRCLE"))
+               (setq c_obj (vlax-ename->vla-object e)
+                     c_copy (vl-catch-all-apply 'vla-Copy (list c_obj)))
+               (if (not (vl-catch-all-error-p c_copy))
+                 (progn
+                   (vla-put-Layer c_copy "n-temp-cols")
+                   (setq subEname (vlax-vla-object->ename c_copy))
+                   ;; Baslangic ve bitis noktasi ust uste binen acik polyline varsa kapat
+                   (if (and (= etype "LWPOLYLINE") (= (vla-get-Closed c_copy) :vlax-false))
+                     (progn
+                       (setq s_pt (vlax-curve-getStartPoint subEname)
+                             e_pt (vlax-curve-getEndPoint subEname))
+                       (if (<= (distance s_pt e_pt) tol)
+                         (vla-put-Closed c_copy :vlax-true)
+                       )
+                     )
+                   )
+                   (setq col_copies (cons subEname col_copies))
+                 )
+               )
+              )
+            )
+            (setq i (1+ i))
+          )
+
+          (foreach subEname col_copies
+            (if (entget subEname)
+              (foreach s (get-ent-segs subEname)
+                (setq col_segs (cons s col_segs))
+              )
+            )
+          )
+
+          (setq walls nil rest1 segs)
+          (while rest1
+            (setq s1 (car rest1) p1 (car s1) p2 (cadr s1)
+                  dx1 (- (car p2) (car p1)) dy1 (- (cadr p2) (cadr p1)) len1 (sqrt (+ (* dx1 dx1) (* dy1 dy1)))
+                  ux (/ dx1 len1) uy (/ dy1 len1) nx (- uy) ny ux rest2 (cdr rest1))
+            (while rest2
+              (setq s2 (car rest2) q1 (car s2) q2 (cadr s2)
+                    dx2 (- (car q2) (car q1)) dy2 (- (cadr q2) (cadr q1)) len2 (sqrt (+ (* dx2 dx2) (* dy2 dy2)))
+                    vx (/ dx2 len2) vy (/ dy2 len2) cross (abs (- (* ux vy) (* uy vx))))
+              (if (< cross 0.015)
+                (progn
+                  (setq d1 (+ (* (- (car q1) (car p1)) nx) (* (- (cadr q1) (cadr p1)) ny))
+                        d2 (+ (* (- (car q2) (car p1)) nx) (* (- (cadr q2) (cadr p1)) ny))
+                        avg_d (* (+ d1 d2) 0.5) abs_d (abs avg_d))
+                  (if (and (< (abs (- d1 d2)) tol) (or (<= (abs (- abs_d t10)) tol) (<= (abs (- abs_d t15)) tol)))
+                    (progn
+                      (setq tq1 (+ (* (- (car q1) (car p1)) ux) (* (- (cadr q1) (cadr p1)) uy))
+                            tq2 (+ (* (- (car q2) (car p1)) ux) (* (- (cadr q2) (cadr p1)) uy))
+                            qmin (min tq1 tq2) qmax (max tq1 tq2)
+                            ov_start (max 0.0 qmin) ov_end (min len1 qmax))
+                      (if (> (- ov_end ov_start) minLen)
+                        (progn
+                          (setq ext_start (min abs_d (abs qmin))
+                                ext_end   (min abs_d (abs (- len1 qmax)))
+                                w_lo      (min 0.0 avg_d)
+                                w_hi      (max 0.0 avg_d)
+                                margin    (* 0.2 tol))
+
+                          ;; Kolon sinirina denk geliyorsa uzatmayi kolon yuzeyinde durdur
+                          (foreach cs_seg col_segs
+                            (setq cs_p1 (car cs_seg) cs_p2 (cadr cs_seg)
+                                  cd1 (+ (* (- (car cs_p1) (car p1)) nx) (* (- (cadr cs_p1) (cadr p1)) ny))
+                                  cd2 (+ (* (- (car cs_p2) (car p1)) nx) (* (- (cadr cs_p2) (cadr p1)) ny))
+                                  ct1 (+ (* (- (car cs_p1) (car p1)) ux) (* (- (cadr cs_p1) (cadr p1)) uy))
+                                  ct2 (+ (* (- (car cs_p2) (car p1)) ux) (* (- (cadr cs_p2) (cadr p1)) uy))
+                                  cmin_d (min cd1 cd2) cmax_d (max cd1 cd2)
+                                  cmin_t (min ct1 ct2) cmax_t (max ct1 ct2))
+                            (if (and (< cmin_d (- w_hi margin)) (> cmax_d (+ w_lo margin)))
+                              (progn
+                                (if (and (<= cmin_t (+ ov_start tol)) (>= cmax_t (- ov_start ext_start)))
+                                  (setq ext_start (min ext_start (max 0.0 (- ov_start cmax_t))))
+                                )
+                                (if (and (>= cmax_t (- ov_end tol)) (<= cmin_t (+ ov_end ext_end)))
+                                  (setq ext_end (min ext_end (max 0.0 (- cmin_t ov_end))))
+                                )
+                              )
+                            )
+                          )
+
+                          (setq t_start (- ov_start ext_start)
+                                t_end   (+ ov_end ext_end))
+                          (setq walls (cons (list p1 ux uy nx ny t_start t_end avg_d) walls))
+                        )
+                      )
+                    )
+                  )
+                )
+              )
+              (setq rest2 (cdr rest2))
+            )
+            (setq rest1 (cdr rest1))
+          )
+
+          (if walls
+            (progn
+              (setq void_prims nil copy_list nil i 0)
+              (while (< i (sslength ss_voids))
+                (setq e (ssname ss_voids i) edata (entget e) etype (cdr (assoc 0 edata)))
+                (cond
+                  ((= etype "INSERT")
+                   (setq blkObj (vlax-ename->vla-object e) copyObj (vl-catch-all-apply 'vla-Copy (list blkObj)))
+                   (if (not (vl-catch-all-error-p copyObj))
+                     (progn
+                       (setq expVar (vl-catch-all-apply 'vla-Explode (list copyObj)))
+                       (vl-catch-all-apply 'vla-Delete (list copyObj))
+                       (if (not (vl-catch-all-error-p expVar))
+                         (progn
+                           (setq expArr (vlax-variant-value expVar) idx 0)
+                           (while (<= idx (vlax-safearray-get-u-bound expArr 1))
+                             (setq subObj (vlax-safearray-get-element expArr idx)
+                                   subEname (vlax-vla-object->ename subObj)
+                                   copy_list (cons subEname copy_list))
+                             (setq idx (1+ idx))
+                           )
+                         )
+                       )
+                     )
+                   )
+                  )
+                  ((= etype "ARC")
+                   (setq va (vlax-curve-getStartPoint e) vb (vlax-curve-getEndPoint e)
+                         vc (trans (cdr (assoc 10 edata)) e 0) rad (cdr (assoc 40 edata)))
+                   (setq void_prims (cons (list "ARC" (list (car va) (cadr va)) (list (car vb) (cadr vb)) (list (car vc) (cadr vc)) rad) void_prims))
+                  )
+                  ((or (= etype "LINE") (= etype "LWPOLYLINE") (= etype "POLYLINE"))
+                   (foreach s (get-ent-segs e) (setq void_prims (cons (list "SEG" (car s) (cadr s)) void_prims)))
+                  )
+                )
+                (setq i (1+ i))
+              )
+
+              (foreach subEname copy_list
+                (if (entget subEname)
+                  (progn
+                    (setq edata (entget subEname) etype (cdr (assoc 0 edata)))
+                    (cond
+                      ((= etype "ARC")
+                       (setq va (vlax-curve-getStartPoint subEname) vb (vlax-curve-getEndPoint subEname)
+                             vc (trans (cdr (assoc 10 edata)) subEname 0) rad (cdr (assoc 40 edata)))
+                       (setq void_prims (cons (list "ARC" (list (car va) (cadr va)) (list (car vb) (cadr vb)) (list (car vc) (cadr vc)) rad) void_prims))
+                      )
+                      ((or (= etype "LINE") (= etype "LWPOLYLINE") (= etype "POLYLINE"))
+                       (foreach s (get-ent-segs subEname) (setq void_prims (cons (list "SEG" (car s) (cadr s)) void_prims)))
+                      )
+                    )
+                    (entdel subEname)
+                  )
+                )
+              )
+
+              (setvar "CLAYER" "n-temp-walls")
+
+              (foreach w walls
+                (setq p1 (nth 0 w) ux (nth 1 w) uy (nth 2 w) nx (nth 3 w) ny (nth 4 w)
+                      t_start (nth 5 w) t_end (nth 6 w) avg_d (nth 7 w)
+                      w_lo (min 0.0 avg_d) w_hi (max 0.0 avg_d) dmin (- w_lo band_tol) dmax (+ w_hi band_tol)
+                      ivs (list (list t_start t_end)) jambs nil)
+
+                (foreach vp void_prims
+                  (setq kind (nth 0 vp) va (nth 1 vp) vb (nth 2 vp)
+                        da (+ (* (- (car va) (car p1)) nx) (* (- (cadr va) (cadr p1)) ny))
+                        db (+ (* (- (car vb) (car p1)) nx) (* (- (cadr vb) (cadr p1)) ny))
+                        ta (+ (* (- (car va) (car p1)) ux) (* (- (cadr va) (cadr p1)) uy))
+                        tb (+ (* (- (car vb) (car p1)) ux) (* (- (cadr vb) (cadr p1)) uy)))
+                  (if (and (>= da dmin) (<= da dmax) (>= ta (- t_start tol)) (<= ta (+ t_end tol))) (setq jambs (cons ta jambs)))
+                  (if (and (>= db dmin) (<= db dmax) (>= tb (- t_start tol)) (<= tb (+ t_end tol))) (setq jambs (cons tb jambs)))
+                )
+
+                (foreach vp void_prims
+                  (setq kind (nth 0 vp) va (nth 1 vp) vb (nth 2 vp)
+                        da (+ (* (- (car va) (car p1)) nx) (* (- (cadr va) (cadr p1)) ny))
+                        db (+ (* (- (car vb) (car p1)) nx) (* (- (cadr vb) (cadr p1)) ny))
+                        ta (+ (* (- (car va) (car p1)) ux) (* (- (cadr va) (cadr p1)) uy))
+                        tb (+ (* (- (car vb) (car p1)) ux) (* (- (cadr vb) (cadr p1)) uy)))
+                  (cond
+                    ((= kind "SEG")
+                     (cond
+                       ((and (>= da dmin) (<= da dmax) (>= db dmin) (<= db dmax) (> (abs (- tb ta)) minLen) (<= (abs (- tb ta)) max_open))
+                        (setq cs (min ta tb) ce (max ta tb) ivs (sub-interval ivs cs ce))
+                       )
+                       ((and (>= da dmin) (<= da dmax) (or (< db dmin) (> db dmax)) (<= (abs (- tb ta)) (* 12.0 unitScale)))
+                        (setq leaf_len (distance va vb))
+                        (if (and (>= leaf_len min_open) (<= leaf_len max_open))
+                          (progn
+                            (setq hit_pos nil)
+                            (foreach jp jambs
+                              (if (<= (abs (- jp (+ ta leaf_len))) (* 8.0 unitScale)) (setq hit_pos (+ ta leaf_len)))
+                              (if (<= (abs (- jp (- ta leaf_len))) (* 8.0 unitScale)) (setq hit_pos (- ta leaf_len)))
+                            )
+                            (if hit_pos (setq ivs (sub-interval ivs (min ta hit_pos) (max ta hit_pos))))
+                          )
+                        )
+                       )
+                       ((and (>= db dmin) (<= db dmax) (or (< da dmin) (> da dmax)) (<= (abs (- tb ta)) (* 12.0 unitScale)))
+                        (setq leaf_len (distance va vb))
+                        (if (and (>= leaf_len min_open) (<= leaf_len max_open))
+                          (progn
+                            (setq hit_pos nil)
+                            (foreach jp jambs
+                              (if (<= (abs (- jp (+ tb leaf_len))) (* 8.0 unitScale)) (setq hit_pos (+ tb leaf_len)))
+                              (if (<= (abs (- jp (- tb leaf_len))) (* 8.0 unitScale)) (setq hit_pos (- tb leaf_len)))
+                            )
+                            (if hit_pos (setq ivs (sub-interval ivs (min tb hit_pos) (max tb hit_pos))))
+                          )
+                        )
+                       )
+                     )
+                    )
+                    ((= kind "ARC")
+                     (setq vc (nth 3 vp) rad (nth 4 vp)
+                           dc (+ (* (- (car vc) (car p1)) nx) (* (- (cadr vc) (cadr p1)) ny))
+                           tc (+ (* (- (car vc) (car p1)) ux) (* (- (cadr vc) (cadr p1)) uy)))
+                     (if (and (>= rad min_open) (<= rad max_open))
+                       (cond
+                         ((and (>= dc dmin) (<= dc dmax) (>= da dmin) (<= da dmax)) (setq ivs (sub-interval ivs (min tc ta) (max tc ta))))
+                         ((and (>= dc dmin) (<= dc dmax) (>= db dmin) (<= db dmax)) (setq ivs (sub-interval ivs (min tc tb) (max tc tb))))
+                         ((and (>= da dmin) (<= da dmax) (<= (abs (- (abs (- tb ta)) rad)) (* 12.0 unitScale))) (setq ivs (sub-interval ivs (min ta tb) (max ta tb))))
+                         ((and (>= db dmin) (<= db dmax) (<= (abs (- (abs (- tb ta)) rad)) (* 12.0 unitScale))) (setq ivs (sub-interval ivs (min ta tb) (max ta tb))))
+                       )
+                     )
+                    )
+                  )
+                )
+
+                (setq offx (* nx avg_d) offy (* ny avg_d))
+                (foreach iv ivs
+                  (if (> (- (cadr iv) (car iv)) minLen)
+                    (progn
+                      (setq c1 (list (+ (car p1) (* ux (car iv)))  (+ (cadr p1) (* uy (car iv))))
+                            c2 (list (+ (car p1) (* ux (cadr iv))) (+ (cadr p1) (* uy (cadr iv))))
+                            c3 (list (+ (car c2) offx) (+ (cadr c2) offy))
+                            c4 (list (+ (car c1) offx) (+ (cadr c1) offy)))
+                      (entmake (list '(0 . "LWPOLYLINE") '(100 . "AcDbEntity") '(8 . "n-temp-walls") '(100 . "AcDbPolyline")
+                                     '(90 . 4) '(70 . 1) (cons 10 c1) (cons 10 c2) (cons 10 c3) (cons 10 c4)))
+                    )
+                  )
+                )
+              )
+
+              (if (setq tw (ssget "X" '((8 . "n-temp-walls") (0 . "LWPOLYLINE"))))
+                (command "_.REGION" tw "")
+              )
+              (if (and (setq tw_reg (ssget "X" '((8 . "n-temp-walls") (0 . "REGION")))) (> (sslength tw_reg) 1))
+                (command "_.UNION" tw_reg "")
+              )
+
+              ;; Kolon kopyalarindan REGION olustur ve duvar alanindan cikar (SUBTRACT)
+              (if col_copies
+                (progn
+                  (setvar "CLAYER" "n-temp-cols")
+                  (command "_.REGION" (ssget "X" '((8 . "n-temp-cols"))) "")
+                  (setq w_final (ssget "X" '((8 . "n-temp-walls") (0 . "REGION")))
+                        c_regs  (ssget "X" '((8 . "n-temp-cols") (0 . "REGION"))))
+                  (if (and w_final c_regs (> (sslength c_regs) 0))
+                    (command "_.SUBTRACT" w_final "" c_regs "")
+                  )
+                )
+              )
+
+              (setq w_final (ssget "X" '((8 . "n-temp-walls") (0 . "REGION"))))
+              (if w_final
+                (progn
+                  (setvar "CLAYER" "n-photoshop")
+                  (setvar "HPLAYER" "n-photoshop")
+                  (setvar "HPSEPARATE" 0)
+                  (setvar "HPISLANDDETECTION" 1)
+                  
+                  (command "_.-HATCH" "_P" "SOLID" "_S" w_final "" "")
+                  
+                  ;; ---> Hatch rengini dogrudan 168,168,168 RGB (True Color) olarak degistiren bolum <---
+                  (setq h_ent (entlast))
+                  (if (and h_ent (= (cdr (assoc 0 (entget h_ent))) "HATCH"))
+                    (progn
+                      (setq h_obj (vlax-ename->vla-object h_ent))
+                      (setq tColor (vl-catch-all-apply 'vla-get-TrueColor (list h_obj)))
+                      (if (not (vl-catch-all-error-p tColor))
+                        (progn
+                          (vla-SetRGB tColor 168 168 168)
+                          (vla-put-TrueColor h_obj tColor)
+                        )
+                      )
+                    )
+                  )
+
+                  (if (setq ss_del (ssget "X" '((8 . "n-temp-walls,n-temp-cols"))))
+                    (command "_.ERASE" ss_del "")
+                  )
+                  (princ "\nTamamlandi! Hatch basariyla '168,168,168' renk koduyla tek parca olusturuldu.")
+                )
+                (princ "\nUyari: Bosluklar ve kolonlar cikarildiktan sonra duvar alani kalmadi.")
+              )
+            )
+            (princ "\nUyari: n-duvar katmaninda 10 veya 15 cm kalinliginda duvar bulunamadi.")
+          )
+        )
+        (princ "\nUyari: Secilen alanda n-duvar katmanina ait cizgi bulunamadi.")
+      )
+    )
+    (princ "\nUyari: Nesne secilmedi.")
+  )
+
+  (setvar "CMDECHO" old-cmdecho)
+  (setvar "OSMODE" old-osmode)
+  (setvar "HPSEPARATE" old-hpsep)
+  (setvar "HPLAYER" old-hplayer)
+  (setvar "HPISLANDDETECTION" old-hpisland)
+  (setvar "CLAYER" old-clayer)
+  (princ)
+)
+
+(princ "\nNDHATCH yuklendi. Komut: NDHATCH")
+(princ)
